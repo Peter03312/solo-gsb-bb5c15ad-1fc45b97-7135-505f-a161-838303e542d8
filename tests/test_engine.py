@@ -1,0 +1,447 @@
+"""编织引擎单元测试。"""
+
+import pytest
+
+from app.engine import (
+    MAX_EXPANDED_LEAVES,
+    ExpansionLimitError,
+    ParseError,
+    analyze_plan,
+    analyze_row,
+    count_leaves,
+    expand_tokens,
+    parse,
+)
+
+
+# ---------------------------------------------------------------- 解析
+def test_parse_basic_leaf_consume_produce():
+    nodes = parse("k5")
+    assert len(nodes) == 1
+    assert nodes[0].consumed == 5 and nodes[0].produced == 5
+
+    nodes = parse("inc3")
+    assert nodes[0].consumed == 1 and nodes[0].produced == 3
+
+    nodes = parse("dec4")
+    assert nodes[0].consumed == 4 and nodes[0].produced == 1
+
+
+def test_parse_sequence_and_whitespace():
+    nodes = parse("  k2 inc3   dec2 ")
+    assert [n.type for n in nodes] == ["k", "inc", "dec"]
+    assert [n.n for n in nodes] == [2, 3, 2]
+
+
+def test_parse_repeat_flat():
+    nodes = parse("[k2 inc1]*3")
+    assert len(nodes) == 1 and nodes[0].type == "repeat" and nodes[0].n == 3
+    # 一轮消耗 2+1=3，产出 2+1=3；重复三轮
+    assert nodes[0].consumed == 9
+    assert nodes[0].produced == 9
+
+
+def test_parse_nested_repeat():
+    nodes = parse("[[k2]*2 inc1]*3")
+    root = nodes[0]
+    assert root.type == "repeat" and root.n == 3
+    assert [c.type for c in root.children] == ["repeat", "inc"]
+    # 内层 [k2]*2 一轮消耗4，加 inc1 一轮消耗5、产出5，重复3轮
+    assert root.consumed == 15
+    assert root.produced == 15
+    assert expand_tokens(nodes) == ["k2", "k2", "inc1"] * 3
+
+
+def test_repeat_without_times_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("[k2]*")
+    assert "正整数" in ei.value.message
+
+
+def test_empty_brackets_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("[  ]*3")
+    assert "为空" in ei.value.message
+
+
+def test_unclosed_bracket_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("k2 [k3*2")
+    assert ei.value.pos == len("k2 [k3*2")
+
+
+def test_bracket_without_repeat_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("[k2]")
+    assert "*M" in ei.value.message
+
+
+def test_extra_closing_bracket_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("k2]")
+    assert ei.value.pos == 2
+
+
+def test_missing_number_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("k2 inc")
+    assert ei.value.pos == 6  # 行尾，'inc' 之后
+
+
+def test_zero_number_fails():
+    with pytest.raises(ParseError):
+        parse("k0")
+    with pytest.raises(ParseError):
+        parse("[k1]*0")
+
+
+def test_unknown_keyword_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("x3")
+    assert ei.value.pos == 0
+
+
+def test_empty_row_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("   ")
+    assert ei.value.pos == 0
+
+
+def test_source_spans_nested():
+    nodes = parse("[k2]*1")
+    rep = nodes[0]
+    leaf = rep.children[0]
+    assert rep.start == 0 and rep.end == 6
+    assert leaf.start == 1 and leaf.end == 3
+
+    nodes = parse("[[k2]*2]*1")
+    inner = nodes[0].children[0]
+    leaf = inner.children[0]
+    assert leaf.start == 2 and leaf.end == 4
+
+
+def test_expansion_limit():
+    with pytest.raises(ExpansionLimitError):
+        count_leaves(parse(f"[k1]*{MAX_EXPANDED_LEAVES + 1}"))
+
+
+# ---------------------------------------------------------------- 自适应重复
+def test_parse_adaptive_marker():
+    nodes = parse("[k2]*~4")
+    rep = nodes[0]
+    assert rep.type == "repeat" and rep.adaptive is True
+    assert rep.target_remaining == 4 and rep.n == 0  # 解析阶段不推导，次数初始为 0
+    assert rep.star_pos == 4
+    assert rep.start == 0 and rep.end == 7
+
+
+def test_parse_adaptive_zero_target():
+    assert parse("[k2]*~0")[0].target_remaining == 0
+
+
+def test_adaptive_repeats_derived_before_expansion():
+    # 20 针：(20-4)/2 = 8 轮，留 4 针给 k4 正好用完
+    rr = analyze_row(0, "[k2]*~4 k4", 20, False)
+    assert rr.status == "ok"
+    assert len(rr.adaptive_blocks) == 1
+    blk = rr.adaptive_blocks[0]
+    assert blk.actual_repeats == 8
+    assert blk.target_remaining == 4
+    assert blk.per_pass_consumed == 2
+    assert rr.consumed == 20 and rr.produced == 20 and rr.remaining == 20
+    assert rr.expanded_count == 9
+    assert rr.expanded_preview == ["k2"] * 8 + ["k4"]
+
+
+def test_adaptive_without_followup_is_unconsumed():
+    # 没有后续指令时，保留下来的 N 针计入未消耗
+    rr = analyze_row(0, "[k2]*~4", 20, False)
+    assert rr.status == "unconsumed"
+    assert rr.adaptive_blocks[0].actual_repeats == 8
+    assert rr.consumed == 16 and rr.unconsumed == 4
+    assert rr.remaining == 16
+
+
+def test_adaptive_zero_repeats_allowed():
+    # 当前剩余恰好等于目标保留针数 => 重复 0 次是合法解
+    rr = analyze_row(0, "k3 [k2]*~7 k7", 10, False)
+    assert rr.status == "ok"
+    assert rr.adaptive_blocks[0].actual_repeats == 0
+    assert rr.consumed == 10
+
+
+def test_adaptive_indivisible_is_error_at_operator():
+    rr = analyze_row(0, "[k2]*~5", 20, False)
+    assert rr.status == "error"
+    assert "整除" in rr.error
+    assert rr.error_pos == 4  # '*' 的列号
+    assert rr.adaptive_blocks == []
+
+
+def test_adaptive_target_too_large_is_error_at_operator():
+    rr = analyze_row(0, "k2 [k2]*~9", 10, False)
+    assert rr.status == "error"
+    assert "无法成立" in rr.error
+    assert rr.error_pos == 7  # 该块 '*' 的列号
+
+
+def test_adaptive_with_nested_fixed_block():
+    # [[k2]*2 inc1] 每轮消耗 5、产出 5；20 针留 5 => 3 轮
+    rr = analyze_row(0, "[[k2]*2 inc1]*~5 k5", 20, False)
+    assert rr.status == "ok"
+    assert rr.adaptive_blocks[0].actual_repeats == 3
+    assert rr.expanded_preview == ["k2", "k2", "inc1"] * 3 + ["k5"]
+    assert rr.consumed == 20
+
+
+def test_nested_adaptive_block_is_syntax_error():
+    rr = analyze_row(0, "[k2 [k1]*~2]*3", 20, False)
+    assert rr.status == "error"
+    assert "顶层" in rr.error
+    assert rr.error_pos == 9  # 内层 '~' 的全局列号
+
+
+def test_multiple_adaptive_blocks_resolved_in_sequence():
+    # 20 -> 第一个块 (20-10)/2=5 轮留10 -> 第二个 (10-5)/1=5 轮留5 -> k5 用完
+    rr = analyze_row(0, "[k2]*~10 [k1]*~5 k5", 20, False)
+    assert rr.status == "ok"
+    assert [b.actual_repeats for b in rr.adaptive_blocks] == [5, 5]
+
+
+def test_adaptive_block_production_passes_to_next_row():
+    # inc2 每轮耗 1 产 2：10 针留 4 => 6 轮，耗 6 产 12；下一行以 12 为可用
+    results = analyze_plan(10, ["[inc2]*~4", "k12"])
+    assert results[0].status == "unconsumed"
+    assert results[0].adaptive_blocks[0].actual_repeats == 6
+    assert results[0].remaining == 12
+    assert results[1].status == "ok" and results[1].available == 12
+
+
+def test_adaptive_failure_blocks_following_rows():
+    results = analyze_plan(10, ["[k2]*~3", "k1"])
+    assert results[0].status == "error"
+    assert results[1].status == "blocked"
+
+
+def test_adaptive_shortage_locates_following_leaf():
+    # [k2]*~10 => (20-10)/2=5 轮留10，dec11 需要 11 针 => 短缺 1
+    rr = analyze_row(0, "[k2]*~10 dec11", 20, False)
+    assert rr.status == "shortage"
+    assert rr.failing_instruction == "dec11"
+    assert rr.shortage == 1 and rr.consumed == 10
+    assert rr.adaptive_blocks[0].actual_repeats == 5
+
+
+def test_adaptive_second_block_failure_reports_first_block_result():
+    rr = analyze_row(0, "[k2]*~10 [k2]*~3", 20, False)
+    assert rr.status == "error" and "整除" in rr.error
+    assert rr.error_pos == 13  # 第二个块的 '*'
+    assert len(rr.adaptive_blocks) == 1
+    assert rr.adaptive_blocks[0].actual_repeats == 5
+
+
+def test_adaptive_expansion_limit_error_at_operator():
+    rr = analyze_row(0, "[k1]*~0", MAX_EXPANDED_LEAVES + 1, False)
+    assert rr.status == "error"
+    assert "上限" in rr.error
+    assert rr.error_pos == 4
+
+
+def test_adaptive_missing_number_fails():
+    with pytest.raises(ParseError) as ei:
+        parse("[k2]*~")
+    assert "非负整数" in ei.value.message
+    with pytest.raises(ParseError):
+        parse("[k2]*~x")
+
+
+def test_adaptive_to_dict_payload():
+    d = analyze_row(0, "[k2]*~4 k4", 20, False).to_dict()
+    blk = d["adaptive_blocks"][0]
+    assert blk["actual_repeats"] == 8
+    assert blk["start"] == 0 and blk["end"] == 7 and blk["star_pos"] == 4
+    assert blk["target_remaining"] == 4
+
+
+# ---------------------------------------------------------------- 逐行审校
+def test_plan_ok_chain():
+    results = analyze_plan(10, ["k10", "inc5 k5", "dec2 k8"])
+    # 行1: 10 -> 10；行2: 消耗 1+5=6 产 5+5=10（未消耗4）；行3: 消耗 2+8=10 产 1+8=9
+    assert [r.status for r in results] == ["ok", "unconsumed", "ok"]
+    assert results[0].remaining == 10
+    assert results[1].available == 10 and results[1].produced == 10
+    assert results[1].unconsumed == 4
+    assert results[2].available == 10 and results[2].remaining == 9
+
+
+def test_shortage_locates_first_failing_instruction():
+    # 可用 6 针：k2（剩4）、inc1（剩3）、dec4 需要4 针 -> 短缺 1
+    rr = analyze_row(0, "k2 inc1 dec4", 6, False)
+    assert rr.status == "shortage"
+    assert rr.failing_instruction == "dec4"
+    assert rr.failing_start == 8 and rr.failing_end == 12
+    assert rr.shortage == 1
+    assert rr.consumed == 3  # 只有前两条执行成功
+
+
+def test_shortage_inside_repeat_points_to_source_leaf():
+    # 重复块 [k3 dec2] 每轮消耗5；可用7：第一轮后剩2，第二轮 dec2 刚好...
+    # k3 剩 -1 -> 第二轮的 k3 失败，短缺1；源位置指向 k3
+    rr = analyze_row(0, "[k3 dec2]*2", 7, False)
+    assert rr.status == "shortage"
+    assert rr.failing_instruction == "k3"
+    assert rr.failing_start == 1 and rr.failing_end == 3
+    assert rr.shortage == 1
+    assert rr.consumed == 5
+
+
+def test_syntax_error_blocks_following_rows():
+    results = analyze_plan(8, ["k8", "inc", "k2"])
+    assert results[0].status == "ok"
+    assert results[1].status == "error"
+    assert results[1].error_pos == 3  # 'inc' 之后行尾
+    assert results[2].status == "blocked"
+
+
+def test_shortage_blocks_following_rows():
+    results = analyze_plan(4, ["dec5", "k1"])
+    assert results[0].status == "shortage"
+    assert results[1].status == "blocked"
+
+
+def test_exact_consumption_is_ok():
+    rr = analyze_row(0, "[inc1 k1]*3", 6, False)  # 每轮消耗2
+    assert rr.status == "ok"
+    assert rr.consumed == 6 and rr.produced == 6 and rr.remaining == 6
+
+
+def test_preview_truncated():
+    rr = analyze_row(0, "k1 " * 300, 300, False)
+    assert rr.status == "ok"
+    assert rr.expanded_count == 300
+    assert rr.expanded_truncated is True
+    assert len(rr.expanded_preview) == 200
+
+
+def test_to_dict_keys():
+    rr = analyze_row(0, "k1", 1, False)
+    d = rr.to_dict()
+    assert d["status"] == "ok" and d["remaining"] == 1
+
+
+# ---------------------------------------------------------------- 针数变化来源
+def test_stitch_changes_basic_entries():
+    # inc3 耗1产3、dec2 耗2产1；k2 无净变化，不列入清单
+    rr = analyze_row(0, "inc3 dec2 k2", 10, False)
+    assert rr.status == "unconsumed"  # 消耗 5 < 可用 10
+    assert [
+        (c.instruction, c.executions, c.consumed, c.produced, c.net)
+        for c in rr.stitch_changes
+    ] == [("inc3", 1, 1, 3, 2), ("dec2", 1, 2, 1, -1)]
+    assert [(c.start, c.end) for c in rr.stitch_changes] == [(0, 4), (5, 9)]
+    assert rr.stitch_net == 1 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_fixed_repeat_merges_executions():
+    # 同一源区间的多次执行合并为一条
+    rr = analyze_row(0, "[inc2 k1]*3", 6, False)
+    assert rr.status == "ok"
+    assert len(rr.stitch_changes) == 1
+    c = rr.stitch_changes[0]
+    assert c.instruction == "inc2" and (c.start, c.end) == (1, 5)
+    assert c.executions == 3 and c.consumed == 3 and c.produced == 6 and c.net == 3
+    assert rr.stitch_net == 3 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_nested_fixed_repeat_multiplies():
+    # 固定块嵌套：执行次数逐层相乘，inc2 共 2×3=6 次
+    rr = analyze_row(0, "[[inc2]*2 k1]*3", 9, False)
+    assert rr.status == "ok"
+    assert len(rr.stitch_changes) == 1
+    c = rr.stitch_changes[0]
+    assert c.executions == 6 and c.consumed == 6 and c.produced == 12 and c.net == 6
+    assert rr.stitch_net == 6 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_adaptive_uses_actual_repeats():
+    # 自适应块使用本行推导出的实际次数：(10-4)/1 = 6 轮
+    rr = analyze_row(0, "[inc2]*~4 k4", 10, False)
+    assert rr.status == "ok"
+    assert rr.adaptive_blocks[0].actual_repeats == 6
+    assert len(rr.stitch_changes) == 1
+    c = rr.stitch_changes[0]
+    assert c.instruction == "inc2" and (c.start, c.end) == (1, 5)
+    assert c.executions == 6 and c.consumed == 6 and c.produced == 12 and c.net == 6
+    assert rr.stitch_net == 6 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_adaptive_with_nested_fixed_block():
+    # 自适应块内嵌套固定块：[[inc2]*2 k1]*~5，每轮耗 3；20 针 => (20-5)/3=5 轮，
+    # inc2 共 5×2=10 次
+    rr = analyze_row(0, "[[inc2]*2 k1]*~5 k5", 20, False)
+    assert rr.status == "ok"
+    assert rr.adaptive_blocks[0].actual_repeats == 5
+    assert len(rr.stitch_changes) == 1
+    c = rr.stitch_changes[0]
+    assert c.executions == 10 and c.consumed == 10 and c.produced == 20 and c.net == 10
+    assert rr.stitch_net == 10 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_same_text_different_positions_listed_separately():
+    # 字面相同但位置不同的指令分列
+    rr = analyze_row(0, "inc2 k1 inc2", 10, False)
+    assert len(rr.stitch_changes) == 2
+    a, b = rr.stitch_changes
+    assert a.instruction == b.instruction == "inc2"
+    assert (a.start, a.end) == (0, 4) and (b.start, b.end) == (8, 12)
+    assert a.executions == b.executions == 1
+    assert rr.stitch_net == 2 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_mixed_inc_dec_in_repeat():
+    # [k2 inc1 dec2]*2：inc1 两次净 0，dec2 两次净 -2
+    rr = analyze_row(0, "[k2 inc1 dec2]*2", 10, False)
+    assert rr.status == "ok"
+    assert [
+        (c.instruction, c.executions, c.consumed, c.produced, c.net)
+        for c in rr.stitch_changes
+    ] == [("inc1", 2, 2, 2, 0), ("dec2", 2, 4, 2, -2)]
+    assert rr.stitch_net == -2 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_zero_repeat_adaptive_not_listed():
+    # 自适应块推导出 0 次：内部指令未执行，不列入清单
+    rr = analyze_row(0, "k3 [inc2]*~7 k7", 10, False)
+    assert rr.status == "ok"
+    assert rr.adaptive_blocks[0].actual_repeats == 0
+    assert rr.stitch_changes == []
+    assert rr.stitch_net == 0 == rr.produced - rr.consumed
+
+
+def test_stitch_changes_not_generated_for_failed_or_blocked_rows():
+    # 短缺行与其后的阻断行都不生成清单
+    results = analyze_plan(4, ["dec5 inc3", "inc2"])
+    assert results[0].status == "shortage"
+    assert results[0].stitch_changes == [] and results[0].stitch_net is None
+    assert results[1].status == "blocked"
+    assert results[1].stitch_changes == [] and results[1].stitch_net is None
+
+    # 语法错误行（含自适应推导失败）同样不生成清单
+    err = analyze_row(0, "inc", 4, False)
+    assert err.status == "error"
+    assert err.stitch_changes == [] and err.stitch_net is None
+    err = analyze_row(0, "[k1 inc2]*~5", 20, False)  # (20-5) 不能被每轮消耗 2 整除
+    assert err.status == "error"
+    assert err.stitch_changes == [] and err.stitch_net is None
+
+
+def test_stitch_changes_to_dict_payload():
+    d = analyze_row(0, "[inc2]*2", 2, False).to_dict()
+    assert d["stitch_net"] == 2
+    assert d["stitch_changes"] == [
+        {"start": 1, "end": 5, "instruction": "inc2", "executions": 2,
+         "consumed": 2, "produced": 4, "net": 2},
+    ]
+    # 失败行的序列化结果同样为空清单 + null
+    d = analyze_row(0, "dec9", 2, False).to_dict()
+    assert d["stitch_changes"] == [] and d["stitch_net"] is None
