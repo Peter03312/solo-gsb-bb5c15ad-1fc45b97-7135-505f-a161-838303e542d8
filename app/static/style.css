@@ -342,3 +342,98 @@ body {
   text-align: center;
   padding: 32px 0;
 }
+
+/* ---------------- 方案对照 ---------------- */
+.baseline-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #fdfbf8;
+}
+.baseline-bar-title { font-size: 13px; font-weight: 700; }
+.baseline-info { font-size: 12px; color: var(--muted); }
+
+.compare-panel { grid-column: 1 / -1; }
+
+.compare-table-wrap { overflow-x: auto; }
+
+.cmp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.cmp-table th, .cmp-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.cmp-table thead th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cmp-table thead tr:first-child th { border-bottom: 1px solid var(--line); }
+.cmp-table .cmp-no {
+  white-space: nowrap;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.cmp-table .cmp-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  word-break: break-all;
+  min-width: 140px;
+}
+.cmp-table .cmp-end {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.cmp-absent { color: var(--muted); font-size: 12px; }
+.cmp-fail { color: var(--err); font-size: 12px; font-weight: 600; }
+
+.cmp-type {
+  display: inline-block;
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cmp-type.unchanged { background: var(--block-bg); color: var(--muted); }
+.cmp-type.modified { background: var(--warn-bg); color: #8a6410; }
+.cmp-type.added { background: var(--ok-bg); color: var(--ok); }
+.cmp-type.deleted { background: var(--err-bg); color: var(--err); }
+
+.cmp-status {
+  display: inline-block;
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+}
+.cmp-status.ok { background: var(--ok); }
+.cmp-status.unconsumed { background: var(--warn); }
+.cmp-status.shortage, .cmp-status.error { background: var(--err); }
+.cmp-status.blocked { background: var(--block); }
+
+.cmp-table tr.t-added td { background: #f2faf5; }
+.cmp-table tr.t-deleted td { background: #fdf3f1; }
+.cmp-table tr.t-modified td { background: #fdf9ec; }
+.cmp-table tr.first-diff td {
+  background: #ffe9c2;
+  box-shadow: inset 0 1px 0 var(--warn), inset 0 -1px 0 var(--warn);
+}
+.cmp-table tr.first-diff td:first-child { box-shadow: inset 3px 0 0 var(--warn), inset 0 1px 0 var(--warn), inset 0 -1px 0 var(--warn); }
+
+.warn-text { color: var(--warn); font-weight: 600; }
+.err-text { color: var(--err); font-weight: 600; }

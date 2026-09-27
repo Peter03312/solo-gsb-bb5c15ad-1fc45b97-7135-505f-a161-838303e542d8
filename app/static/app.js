@@ -3,6 +3,7 @@
 /* 编织行指令审校前端：编辑 -> 防抖调用 /api/analyze -> 渲染逐行结果 */
 
 const STORAGE_KEY = "knit-review-plan-v1";
+const BASELINE_KEY = "knit-review-baseline-v1";
 const DEBOUNCE_MS = 250;
 
 const EXAMPLE = {
@@ -28,9 +29,22 @@ const els = {
   btnImport: document.getElementById("btn-import"),
   btnExport: document.getElementById("btn-export"),
   file: document.getElementById("file-import"),
+  btnSaveBaseline: document.getElementById("btn-save-baseline"),
+  btnClearBaseline: document.getElementById("btn-clear-baseline"),
+  baselineInfo: document.getElementById("baseline-info"),
+  comparePanel: document.getElementById("compare-panel"),
+  compareSummary: document.getElementById("compare-summary"),
+  compareTableWrap: document.getElementById("compare-table-wrap"),
+  compareState: document.getElementById("compare-state"),
 };
 
 let state = load() || { start_stitches: 20, rows: [...EXAMPLE.rows] };
+let baseline = loadBaseline();
+// 最近一次逐行审校接口结果：两侧分别缓存，一侧失败不影响另一侧展示。
+let currentRows = null;
+let currentErr = null;
+let baselineRows = null;
+let baselineErr = null;
 let debounceTimer = null;
 let reqSeq = 0;
 
@@ -50,6 +64,60 @@ function load() {
 function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
+
+// ---------------------------------------------------------------- 基线存取
+function loadBaseline() {
+  try {
+    const raw = localStorage.getItem(BASELINE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (typeof obj.start_stitches !== "number" || !Array.isArray(obj.rows)) return null;
+    return {
+      start_stitches: obj.start_stitches,
+      rows: obj.rows.map(String),
+      saved_at: typeof obj.saved_at === "string" ? obj.saved_at : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function fmtTime(iso) {
+  if (!iso) return "未知时间";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+function updateBaselineBar() {
+  const has = !!baseline;
+  els.btnClearBaseline.hidden = !has;
+  els.btnSaveBaseline.textContent = has ? "更新基线为当前" : "保存当前为基线";
+  els.baselineInfo.textContent = has
+    ? `基线：起始 ${baseline.start_stitches} 针 · ${baseline.rows.length} 行 · 保存于 ${fmtTime(baseline.saved_at)}`
+    : "尚未保存基线。保存后可在下方对照当前编辑与基线的差异。";
+}
+
+els.btnSaveBaseline.addEventListener("click", () => {
+  baseline = {
+    start_stitches: state.start_stitches,
+    rows: [...state.rows],
+    saved_at: new Date().toISOString(),
+  };
+  localStorage.setItem(BASELINE_KEY, JSON.stringify(baseline));
+  baselineRows = null;
+  baselineErr = null;
+  updateBaselineBar();
+  analyze();
+});
+
+els.btnClearBaseline.addEventListener("click", () => {
+  baseline = null;
+  baselineRows = null;
+  baselineErr = null;
+  localStorage.removeItem(BASELINE_KEY);
+  updateBaselineBar();
+  renderCompare();
+});
 
 // ---------------------------------------------------------------- 编辑器
 function renderEditor(focusIndex = -1) {
@@ -134,27 +202,45 @@ function scheduleAnalyze() {
   debounceTimer = setTimeout(analyze, DEBOUNCE_MS);
 }
 
+async function postAnalyze(plan) {
+  const resp = await fetch("/api/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ start_stitches: plan.start_stitches, rows: plan.rows }),
+  });
+  if (!resp.ok) throw new Error(`服务返回 ${resp.status}`);
+  return (await resp.json()).rows;
+}
+
 async function analyze() {
   const seq = ++reqSeq;
-  try {
-    const resp = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ start_stitches: state.start_stitches, rows: state.rows }),
-    });
-    if (!resp.ok) throw new Error(`服务返回 ${resp.status}`);
-    const data = await resp.json();
-    if (seq === reqSeq) {
-      renderResults(data.rows);
-      els.sync.textContent = "已同步";
-      els.sync.className = "sync-state";
-    }
-  } catch (err) {
-    if (seq === reqSeq) {
-      els.sync.textContent = "分析失败：" + err.message;
-      els.sync.className = "sync-state error";
-    }
+  // 当前方案与基线分别调用同一个逐行审校接口，各自独立 await：
+  // 一侧请求失败时，另一侧的结果仍照常渲染（对照表中失败侧标注「分析失败」）。
+  // 回调内检查 seq，过期响应直接丢弃，避免覆盖更新一轮的结果。
+  const curTask = postAnalyze(state).then(
+    (rows) => { if (seq === reqSeq) { currentRows = rows; currentErr = null; } },
+    (err) => { if (seq === reqSeq) { currentRows = null; currentErr = err.message; } },
+  );
+  const baseTask = baseline
+    ? postAnalyze(baseline).then(
+        (rows) => { if (seq === reqSeq) { baselineRows = rows; baselineErr = null; } },
+        (err) => { if (seq === reqSeq) { baselineRows = null; baselineErr = err.message; } },
+      )
+    : Promise.resolve();
+
+  await curTask;
+  if (seq !== reqSeq) return;
+  if (currentRows) {
+    renderResults(currentRows);
+    els.sync.textContent = "已同步";
+    els.sync.className = "sync-state";
+  } else {
+    els.sync.textContent = "分析失败：" + currentErr;
+    els.sync.className = "sync-state error";
   }
+
+  await baseTask;
+  if (seq === reqSeq) renderCompare();
 }
 
 // ---------------------------------------------------------------- 结果渲染
@@ -408,6 +494,93 @@ function renderCard(row, i) {
   return card;
 }
 
+// ---------------------------------------------------------------- 方案对照
+// 对齐与首个分歧定位的纯逻辑在 compare.js（alignRows / rowEndStitches /
+// findFirstDivergence），此处只负责渲染。
+const DIFF_TYPE_TEXT = { unchanged: "未变", modified: "修改", added: "新增", deleted: "删除" };
+
+function cmpStatusCell(row, analyzeErr) {
+  if (analyzeErr) return `<span class="cmp-fail" title="${escapeHtml(analyzeErr)}">分析失败</span>`;
+  if (!row) return '<span class="cmp-absent">—</span>';
+  return `<span class="cmp-status ${row.status}">${STATUS_TEXT[row.status] || row.status}</span>`;
+}
+
+function cmpEndCell(row, analyzeErr) {
+  if (analyzeErr) return '<span class="cmp-absent">—</span>';
+  const end = rowEndStitches(row);
+  return end == null ? '<span class="cmp-absent">—</span>' : `<b>${end}</b>`;
+}
+
+function cmpSideCells(idx, text, results, analyzeErr) {
+  const row = results ? results[idx] : null;
+  return (
+    `<td class="cmp-no">第 ${idx + 1} 行</td>` +
+    `<td class="cmp-text">${escapeHtml(text) || '<span class="cmp-absent">（空行）</span>'}</td>` +
+    `<td>${cmpStatusCell(row, analyzeErr)}</td>` +
+    `<td class="cmp-end">${cmpEndCell(row, analyzeErr)}</td>`
+  );
+}
+
+function renderCompare() {
+  if (!baseline) {
+    els.comparePanel.hidden = true;
+    return;
+  }
+  els.comparePanel.hidden = false;
+
+  const items = alignRows(baseline.rows, state.rows);
+  const counts = { unchanged: 0, modified: 0, added: 0, deleted: 0 };
+  items.forEach((it) => { counts[it.type] += 1; });
+
+  // 首个双方都有行且状态或行末针数不同的位置（缺席行不参与判定）
+  const firstDiff = findFirstDivergence(items, baselineRows, currentRows);
+
+  const badges = [];
+  badges.push(`基线 起始 <b>${baseline.start_stitches}</b> 针 · <b>${baseline.rows.length}</b> 行`);
+  badges.push(`当前 起始 <b>${state.start_stitches}</b> 针 · <b>${state.rows.length}</b> 行`);
+  if (baseline.start_stitches !== state.start_stitches) {
+    badges.push('<span class="warn-text">⚠️ 起始针数不同</span>');
+  }
+  badges.push(`未变 <b>${counts.unchanged}</b>`);
+  if (counts.modified) badges.push(`修改 <b>${counts.modified}</b>`);
+  if (counts.added) badges.push(`新增 <b>${counts.added}</b>`);
+  if (counts.deleted) badges.push(`删除 <b>${counts.deleted}</b>`);
+  if (currentErr || baselineErr) {
+    const which = currentErr && baselineErr ? "两侧" : (currentErr ? "当前侧" : "基线侧");
+    badges.push(`<span class="err-text">⚠️ ${which}分析失败，已展示另一侧结果</span>`);
+  } else if (firstDiff >= 0) {
+    const it = items[firstDiff];
+    badges.push(`⚑ 首个分歧：基线第 <b>${it.baseIdx + 1}</b> 行 ↔ 当前第 <b>${it.curIdx + 1}</b> 行`);
+  } else {
+    badges.push("两版共有行的状态与行末针数一致");
+  }
+  els.compareSummary.innerHTML = badges.map((b) => `<span class="badge">${b}</span>`).join("");
+  els.compareState.textContent = (currentErr || baselineErr) ? "部分分析失败" : "";
+  els.compareState.className = "sync-state" + ((currentErr || baselineErr) ? " error" : "");
+
+  const trs = items.map((it, k) => {
+    const isFirst = k === firstDiff;
+    const typeTag = isFirst
+      ? `<span class="cmp-type ${it.type}">⚑ 首个分歧</span>`
+      : `<span class="cmp-type ${it.type}">${DIFF_TYPE_TEXT[it.type]}</span>`;
+    const baseCells = it.baseIdx != null
+      ? cmpSideCells(it.baseIdx, baseline.rows[it.baseIdx], baselineRows, baselineErr)
+      : '<td colspan="4" class="cmp-absent">（基线无此行）</td>';
+    const curCells = it.curIdx != null
+      ? cmpSideCells(it.curIdx, state.rows[it.curIdx], currentRows, currentErr)
+      : '<td colspan="4" class="cmp-absent">（当前无此行）</td>';
+    return `<tr class="t-${it.type}${isFirst ? " first-diff" : ""}">`
+      + `<td>${typeTag}</td>${baseCells}${curCells}</tr>`;
+  });
+
+  els.compareTableWrap.innerHTML =
+    '<table class="cmp-table"><thead>' +
+    '<tr><th rowspan="2">变更</th><th colspan="4">基线</th><th colspan="4">当前</th></tr>' +
+    '<tr><th>行</th><th>文本</th><th>状态</th><th>行末针数</th>' +
+    '<th>行</th><th>文本</th><th>状态</th><th>行末针数</th></tr>' +
+    `</thead><tbody>${trs.join("")}</tbody></table>`;
+}
+
 // ---------------------------------------------------------------- 导入导出
 els.btnExample.addEventListener("click", () => {
   state = { start_stitches: EXAMPLE.start_stitches, rows: [...EXAMPLE.rows] };
@@ -460,4 +633,5 @@ els.file.addEventListener("change", () => {
 
 // ---------------------------------------------------------------- 启动
 renderEditor();
+updateBaselineBar();
 scheduleAnalyze();

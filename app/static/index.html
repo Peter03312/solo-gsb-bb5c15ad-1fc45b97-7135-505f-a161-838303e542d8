@@ -33,6 +33,13 @@
 
       <button id="btn-add-row" type="button" class="btn btn-block">＋ 添加一行</button>
 
+      <div class="baseline-bar">
+        <span class="baseline-bar-title">方案对照</span>
+        <button id="btn-save-baseline" type="button" class="btn btn-mini">保存当前为基线</button>
+        <button id="btn-clear-baseline" type="button" class="btn btn-mini danger" hidden>清除基线</button>
+        <span id="baseline-info" class="baseline-info"></span>
+      </div>
+
       <details class="syntax-help">
         <summary>语法说明</summary>
         <ul>
@@ -52,8 +59,18 @@
       <div id="summary" class="summary"></div>
       <div id="results" class="results"></div>
     </section>
+
+    <section class="panel compare-panel" id="compare-panel" hidden>
+      <div class="panel-title">
+        <h2>方案对照（基线 ↔ 当前）</h2>
+        <span id="compare-state" class="sync-state" aria-live="polite"></span>
+      </div>
+      <div id="compare-summary" class="summary"></div>
+      <div id="compare-table-wrap" class="compare-table-wrap"></div>
+    </section>
   </main>
 
+  <script src="/static/compare.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
