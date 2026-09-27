@@ -29,6 +29,12 @@
         <input id="start-stitches" type="number" min="0" step="1" value="20" />
       </label>
 
+      <div class="baseline-bar">
+        <button id="btn-save-baseline" type="button" class="btn btn-mini">☆ 存为基线</button>
+        <button id="btn-clear-baseline" type="button" class="btn btn-mini danger" hidden>清除基线</button>
+        <span id="baseline-info" class="baseline-info">尚未保存基线</span>
+      </div>
+
       <div id="rows-editor" class="rows-editor"></div>
 
       <button id="btn-add-row" type="button" class="btn btn-block">＋ 添加一行</button>
@@ -51,6 +57,15 @@
       <div class="panel-title"><h2>逐行审校结果</h2></div>
       <div id="summary" class="summary"></div>
       <div id="results" class="results"></div>
+    </section>
+
+    <section id="compare-panel" class="panel compare-panel" hidden>
+      <div class="panel-title"><h2>方案对照（基线 ↔ 当前）</h2></div>
+      <div id="compare-summary" class="summary"></div>
+      <div id="compare-banner" class="compare-banner"></div>
+      <div class="compare-table-wrap">
+        <table id="compare-table" class="compare-table"></table>
+      </div>
     </section>
   </main>
 

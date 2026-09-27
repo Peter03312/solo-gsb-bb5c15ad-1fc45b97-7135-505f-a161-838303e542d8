@@ -3,6 +3,7 @@
 /* 编织行指令审校前端：编辑 -> 防抖调用 /api/analyze -> 渲染逐行结果 */
 
 const STORAGE_KEY = "knit-review-plan-v1";
+const BASELINE_KEY = "knit-review-baseline-v1";
 const DEBOUNCE_MS = 250;
 
 const EXAMPLE = {
@@ -28,11 +29,27 @@ const els = {
   btnImport: document.getElementById("btn-import"),
   btnExport: document.getElementById("btn-export"),
   file: document.getElementById("file-import"),
+  btnSaveBaseline: document.getElementById("btn-save-baseline"),
+  btnClearBaseline: document.getElementById("btn-clear-baseline"),
+  baselineInfo: document.getElementById("baseline-info"),
+  comparePanel: document.getElementById("compare-panel"),
+  compareSummary: document.getElementById("compare-summary"),
+  compareBanner: document.getElementById("compare-banner"),
+  compareTable: document.getElementById("compare-table"),
 };
 
 let state = load() || { start_stitches: 20, rows: [...EXAMPLE.rows] };
 let debounceTimer = null;
 let reqSeq = 0;
+
+// 方案对照：基线快照（起始针数 + 行文本）存于浏览器 localStorage；
+// 基线审校结果缓存于 baselineRows，基线内容变化时失效重取。
+let baseline = loadBaseline();
+let baselineRows = null;
+let baselineFetchError = null;
+let baselineFetchPromise = null;
+let currentRows = null; // 最近一次当前方案的审校结果（请求失败时为 null）
+let currentFetchError = null;
 
 // ---------------------------------------------------------------- 初始化
 function load() {
@@ -49,6 +66,44 @@ function load() {
 
 function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+// ---------------------------------------------------------------- 基线快照
+function loadBaseline() {
+  try {
+    const raw = localStorage.getItem(BASELINE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (typeof obj.start_stitches !== "number" || !Array.isArray(obj.rows)) return null;
+    return {
+      start_stitches: obj.start_stitches,
+      rows: obj.rows.map(String),
+      saved_at: typeof obj.saved_at === "string" ? obj.saved_at : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistBaseline() {
+  if (baseline) localStorage.setItem(BASELINE_KEY, JSON.stringify(baseline));
+  else localStorage.removeItem(BASELINE_KEY);
+}
+
+function updateBaselineBar() {
+  els.btnClearBaseline.hidden = !baseline;
+  els.btnSaveBaseline.textContent = baseline ? "☆ 更新基线" : "☆ 存为基线";
+  if (!baseline) {
+    els.baselineInfo.textContent = "尚未保存基线";
+    return;
+  }
+  let when = "";
+  if (baseline.saved_at) {
+    const t = new Date(baseline.saved_at);
+    if (!Number.isNaN(t.getTime())) when = ` · 存于 ${t.toLocaleString()}`;
+  }
+  els.baselineInfo.textContent =
+    `基线：起始 ${baseline.start_stitches} 针 · ${baseline.rows.length} 行${when}（对照见下方）`;
 }
 
 // ---------------------------------------------------------------- 编辑器
@@ -145,16 +200,21 @@ async function analyze() {
     if (!resp.ok) throw new Error(`服务返回 ${resp.status}`);
     const data = await resp.json();
     if (seq === reqSeq) {
+      currentRows = data.rows;
+      currentFetchError = null;
       renderResults(data.rows);
       els.sync.textContent = "已同步";
       els.sync.className = "sync-state";
     }
   } catch (err) {
     if (seq === reqSeq) {
+      currentRows = null;
+      currentFetchError = err.message;
       els.sync.textContent = "分析失败：" + err.message;
       els.sync.className = "sync-state error";
     }
   }
+  if (seq === reqSeq) await updateCompare(seq);
 }
 
 // ---------------------------------------------------------------- 结果渲染
@@ -408,6 +468,239 @@ function renderCard(row, i) {
   return card;
 }
 
+// ---------------------------------------------------------------- 方案对照
+// 基线与当前两版分别调用 /api/analyze 独立审校；对齐只依据原始行文本，
+// 因此一侧出现语法错误 / 阻断时，另一侧后续行的结果仍正常展示。
+const DIFF_TYPE_TEXT = { same: "相同", modified: "修改", added: "新增", deleted: "删除" };
+
+function alignRows(a, b) {
+  /* 稳定的最长公共子序列（LCS）对齐，按原始行文本精确比较。
+     - 文本相等即配对：重复文本取最靠前的可行配对（两侧同时最早）；
+     - 文本不同且 LCS 长度平局时优先跳过基线行；
+     - 相邻配对之间的未配对区段，两侧按顺序成对标记「修改」，
+       多出的行分别标记「删除」（仅基线有）或「新增」（仅当前有）。
+     返回条目列表：{ type: same|modified|added|deleted, a: 基线下标|null, b: 当前下标|null }。*/
+  const n = a.length, m = b.length;
+  // dp[i][j] = a[i:] 与 b[j:] 的 LCS 长度
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const entries = [];
+  const flush = (ai, bi, aj, bj) => {
+    // 未配对区段 a[ai..bi) ↔ b[aj..bj)：按顺序成对为「修改」，剩余为「删除/新增」
+    const la = bi - ai, lb = bj - aj;
+    const pairs = Math.min(la, lb);
+    for (let k = 0; k < pairs; k++) entries.push({ type: "modified", a: ai + k, b: aj + k });
+    for (let k = pairs; k < la; k++) entries.push({ type: "deleted", a: ai + k, b: null });
+    for (let k = pairs; k < lb; k++) entries.push({ type: "added", a: null, b: aj + k });
+  };
+  let i = 0, j = 0, segA = 0, segB = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      flush(segA, i, segB, j);
+      entries.push({ type: "same", a: i, b: j });
+      i++; j++;
+      segA = i; segB = j;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+  flush(segA, n, segB, m);
+  return entries;
+}
+
+function endStitchesOf(row) {
+  // 行末针数：仅通过 / 未全部消耗的行有确定产出；错误 / 短缺 / 阻断行为 null（显示 —）
+  return row && (row.status === "ok" || row.status === "unconsumed") ? row.remaining : null;
+}
+
+function fmtEndStitches(row) {
+  const v = endStitchesOf(row);
+  return v === null ? "—" : String(v);
+}
+
+function findFirstDivergence(entries, baseRows, currRows) {
+  // 首个双方都有行且状态或行末针数不同的对照条目下标；
+  // 缺席行（新增 / 删除）不参与该判定。无分歧返回 -1。
+  for (let k = 0; k < entries.length; k++) {
+    const e = entries[k];
+    if (e.a === null || e.b === null) continue;
+    const ra = baseRows[e.a];
+    const rb = currRows[e.b];
+    if (!ra || !rb) continue;
+    if (ra.status !== rb.status || endStitchesOf(ra) !== endStitchesOf(rb)) return k;
+  }
+  return -1;
+}
+
+function ensureBaselineAnalysis() {
+  // 基线内容不变时复用缓存；请求失败记录错误，下个分析周期自动重试。
+  if (baselineRows !== null) return Promise.resolve();
+  if (baselineFetchPromise) return baselineFetchPromise;
+  baselineFetchPromise = (async () => {
+    try {
+      const resp = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ start_stitches: baseline.start_stitches, rows: baseline.rows }),
+      });
+      if (!resp.ok) throw new Error(`服务返回 ${resp.status}`);
+      const data = await resp.json();
+      baselineRows = data.rows;
+      baselineFetchError = null;
+    } catch (err) {
+      baselineFetchError = err.message;
+    } finally {
+      baselineFetchPromise = null;
+    }
+  })();
+  return baselineFetchPromise;
+}
+
+async function updateCompare(seq) {
+  if (!baseline) { renderCompare(); return; }
+  renderCompare(); // 先渲染（基线结果未就绪时显示“计算中”）
+  await ensureBaselineAnalysis();
+  if (seq === reqSeq) renderCompare();
+}
+
+function compareSideCells(present, no, text, row, statusDiff, endDiff) {
+  if (!present) {
+    return `<td class="cmp-empty">—</td><td class="cmp-empty">（缺席）</td>`
+      + `<td class="cmp-empty">—</td><td class="cmp-empty">—</td>`;
+  }
+  const statusHtml = row
+    ? `<span class="cmp-status st-${row.status}">${STATUS_TEXT[row.status] || row.status}</span>`
+    : `<span class="cmp-empty">—</span>`;
+  const endHtml = row ? fmtEndStitches(row) : "—";
+  return `<td class="cmp-no">第 ${no} 行</td>`
+    + `<td class="cmp-text">${escapeHtml(text) || "<span class='cmp-empty'>（空行）</span>"}</td>`
+    + `<td class="${statusDiff ? "cmp-diff-cell" : ""}">${statusHtml}</td>`
+    + `<td class="cmp-num ${endDiff ? "cmp-diff-cell" : ""}">${endHtml}</td>`;
+}
+
+function renderCompare() {
+  if (!baseline) {
+    els.comparePanel.hidden = true;
+    return;
+  }
+  els.comparePanel.hidden = false;
+
+  const entries = alignRows(baseline.rows, state.rows);
+  const counts = { same: 0, modified: 0, added: 0, deleted: 0 };
+  entries.forEach((e) => { counts[e.type] += 1; });
+
+  const ready = baselineRows !== null && currentRows !== null;
+  const firstDiv = ready ? findFirstDivergence(entries, baselineRows, currentRows) : -1;
+
+  // 汇总徽标
+  const badges = [];
+  badges.push(`基线 · 起始 <b>${baseline.start_stitches}</b> 针 · <b>${baseline.rows.length}</b> 行`);
+  badges.push(`当前 · 起始 <b>${state.start_stitches}</b> 针 · <b>${state.rows.length}</b> 行`);
+  if (baseline.start_stitches !== state.start_stitches) {
+    badges.push(`<span class="cmp-badge-warn">⚠️ 起始针数不同</span>`);
+  }
+  badges.push(`相同 <b>${counts.same}</b>`);
+  badges.push(`修改 <b>${counts.modified}</b>`);
+  badges.push(`新增 <b>${counts.added}</b>`);
+  badges.push(`删除 <b>${counts.deleted}</b>`);
+  els.compareSummary.innerHTML = badges.map((b) => `<span class="badge">${b}</span>`).join("");
+
+  // 横幅：首个分歧 / 一致 / 异常
+  let bannerClass = "same";
+  let bannerText;
+  if (baselineFetchError) {
+    bannerClass = "err";
+    bannerText = `基线分析失败：${baselineFetchError}（当前方案的逐行审校结果不受影响，见上方）`;
+  } else if (currentFetchError) {
+    bannerClass = "err";
+    bannerText = `当前方案分析失败：${currentFetchError}（基线结果仍展示在下表）`;
+  } else if (!ready) {
+    bannerClass = "warn";
+    bannerText = "审校计算中…";
+  } else if (firstDiv >= 0) {
+    const e = entries[firstDiv];
+    const ra = baselineRows[e.a];
+    const rb = currentRows[e.b];
+    bannerClass = "div";
+    bannerText = `⚑ 首个分歧：基线第 ${e.a + 1} 行 ↔ 当前第 ${e.b + 1} 行 —— `
+      + `状态 ${STATUS_TEXT[ra.status] || ra.status} → ${STATUS_TEXT[rb.status] || rb.status}，`
+      + `行末针数 ${fmtEndStitches(ra)} → ${fmtEndStitches(rb)}`;
+  } else {
+    bannerText = "两版在双方都有行的位置上，状态与行末针数一致。";
+  }
+  els.compareBanner.className = `compare-banner ${bannerClass}`;
+  els.compareBanner.textContent = bannerText;
+
+  // 对照表：双方行号、文本、状态、行末针数
+  const table = els.compareTable;
+  table.innerHTML = "";
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr>"
+    + "<th>基线行</th><th>基线文本</th><th>状态</th><th>行末针数</th>"
+    + "<th>对照</th>"
+    + "<th>当前行</th><th>当前文本</th><th>状态</th><th>行末针数</th>"
+    + "</tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+
+  if (entries.length === 0) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="9" class="cmp-empty">两版都没有行。</td>`;
+    tbody.appendChild(tr);
+  }
+
+  entries.forEach((e, k) => {
+    const tr = document.createElement("tr");
+    tr.className = `cmp-${e.type}`;
+    if (k === firstDiv) tr.classList.add("cmp-first-div");
+
+    const ra = e.a !== null && baselineRows ? baselineRows[e.a] : null;
+    const rb = e.b !== null && currentRows ? currentRows[e.b] : null;
+    const statusDiff = ready && ra && rb && ra.status !== rb.status;
+    const endDiff = ready && ra && rb && endStitchesOf(ra) !== endStitchesOf(rb);
+
+    tr.innerHTML =
+      compareSideCells(e.a !== null, e.a !== null ? e.a + 1 : null,
+        e.a !== null ? baseline.rows[e.a] : null, ra, statusDiff, endDiff)
+      + `<td><span class="cmp-type ${e.type}">${DIFF_TYPE_TEXT[e.type]}`
+      + `${k === firstDiv ? " ⚑" : ""}</span></td>`
+      + compareSideCells(e.b !== null, e.b !== null ? e.b + 1 : null,
+        e.b !== null ? state.rows[e.b] : null, rb, statusDiff, endDiff);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+}
+
+els.btnSaveBaseline.addEventListener("click", () => {
+  baseline = {
+    start_stitches: state.start_stitches,
+    rows: [...state.rows],
+    saved_at: new Date().toISOString(),
+  };
+  persistBaseline();
+  baselineRows = null;
+  baselineFetchError = null;
+  updateBaselineBar();
+  scheduleAnalyze();
+});
+
+els.btnClearBaseline.addEventListener("click", () => {
+  baseline = null;
+  persistBaseline();
+  baselineRows = null;
+  baselineFetchError = null;
+  updateBaselineBar();
+  renderCompare();
+});
+
 // ---------------------------------------------------------------- 导入导出
 els.btnExample.addEventListener("click", () => {
   state = { start_stitches: EXAMPLE.start_stitches, rows: [...EXAMPLE.rows] };
@@ -460,4 +753,5 @@ els.file.addEventListener("change", () => {
 
 // ---------------------------------------------------------------- 启动
 renderEditor();
+updateBaselineBar();
 scheduleAnalyze();
